@@ -1,101 +1,187 @@
-import subprocess
-from pathlib import Path
-from typing import List
-from fetcher import SongMetadata
 import logging
+import subprocess
+import sys
+import requests
+import os
+from pathlib import Path
+from typing import List, Dict, Optional
+from dataclasses import dataclass
+from parser import SongInput
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
-def assemble_video(metadatas: List[SongMetadata], frames_dir: Path, audio_dir: Path,
-                   output_file: Path, clip_duration: float = 15.0, transition_duration: float = 1.0):
+LASTFM_API_BASE = "http://ws.audioscrobbler.com/2.0/"
+SIZE_PRIORITY = {"small": 1, "medium": 2, "large": 3, "extralarge": 4, "mega": 5}
+
+@dataclass
+class SongMetadata:
+    position: int
+    title: str
+    artist: str
+    album: str = "N/A"
+    year: str = "N/A"
+    genre: str = "N/A"
+    rym_rating: str = "N/A"
+    aoty_rating: str = "N/A"
+    cover_path: str = ""
+    excerpt_path: str = ""
+
+def get_api_key() -> str:
+    """Get Last.fm API key from environment variable, exit if not set."""
+    key = os.environ.get("LASTFM_API_KEY")
+    if not key:
+        logger.critical("LASTFM_API_KEY environment variable not set.")
+        sys.exit(1)
+    return key
+
+def fetch_all(songs: List[SongInput], output_dir: Path) -> List[SongMetadata]:
     """
-    Create individual clips (frame + audio) using ffmpeg, then concatenate
-    with xfade transitions for video and acrossfade for audio.
+    Enrich songs with metadata from Last.fm, download covers and audio excerpts.
+    Fail-safe: generates placeholders for missing cover/audio.
     """
-    clips_dir = Path("./tmp/clips")
-    clips_dir.mkdir(parents=True, exist_ok=True)
+    covers_dir = output_dir / "covers"
+    audio_dir = output_dir / "audio"
+    covers_dir.mkdir(parents=True, exist_ok=True)
+    audio_dir.mkdir(parents=True, exist_ok=True)
     
-    n = len(metadatas)
-    if n == 0:
-        raise ValueError("No songs to process")
+    api_key = get_api_key()
+    results = []
     
-    # Generate intermediate clips (video+audio) for each song
-    clip_paths = []
-    for meta in metadatas:
-        idx = meta.position
-        frame = frames_dir / f"{idx:02d}.png"
-        audio = audio_dir / f"{idx:02d}.mp3"
-        clip = clips_dir / f"{idx:02d}.mp4"
+    for song in songs:
+        logger.info(f"Processing #{song.position}: {song.artist} - {song.title}")
+        meta = SongMetadata(position=song.position, title=song.title, artist=song.artist)
         
-        cmd = [
-            "ffmpeg", "-y",
-            "-loop", "1", "-i", str(frame),
-            "-i", str(audio),
-            "-c:v", "libx264", "-tune", "stillimage",
-            "-c:a", "aac", "-b:a", "192k",
-            "-shortest", "-t", str(clip_duration),
-            str(clip)
-        ]
-        logger.info(f"Creating clip for position {idx}")
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        if result.returncode != 0:
-            logger.error(f"Failed to create clip {idx}: {result.stderr}")
-        clip_paths.append(clip)
+        # Attempt to get metadata from Last.fm
+        try:
+            track_data = get_track_info(song.artist, song.title, api_key)
+            meta.album = track_data.get("album", "N/A")
+            # Year not directly available in track.getInfo; we keep N/A
+            meta.genre = track_data.get("genre", "N/A")
+            cover_url = track_data.get("cover_url")
+        except Exception as e:
+            logger.warning(f"Last.fm track.getInfo failed for {song.artist} - {song.title}: {e}")
+            cover_url = None
+        
+        # Download cover
+        cover_file = covers_dir / f"{song.position:02d}.png"
+        if cover_url:
+            try:
+                download_image(cover_url, cover_file)
+                meta.cover_path = str(cover_file)
+            except Exception as e:
+                logger.error(f"Cover download failed, using placeholder: {e}")
+        if not meta.cover_path:
+            create_placeholder_cover(cover_file)
+            meta.cover_path = str(cover_file)
+        
+        # Download audio excerpt (unchanged)
+        excerpt_file = audio_dir / f"{song.position:02d}.mp3"
+        try:
+            download_excerpt(song.artist, song.title, excerpt_file)
+            meta.excerpt_path = str(excerpt_file)
+        except Exception as e:
+            logger.error(f"Audio excerpt failed, using silent placeholder: {e}")
+            generate_silent_audio(excerpt_file, duration=15)
+            meta.excerpt_path = str(excerpt_file)
+        
+        results.append(meta)
+    
+    return results
 
-    if n == 1:
-        # Just copy the single clip
-        subprocess.run(["cp", str(clip_paths[0]), str(output_file)], check=True)
-        logger.info(f"Single clip video saved to {output_file}")
-        return
+def get_track_info(artist: str, track: str, api_key: str) -> Dict[str, str]:
+    """
+    Query Last.fm track.getInfo and extract relevant metadata.
+    Returns dict with keys 'album', 'genre', 'cover_url'.
+    Raises exception on API error or missing track.
+    """
+    params = {
+        "method": "track.getInfo",
+        "api_key": api_key,
+        "artist": artist,
+        "track": track,
+        "autocorrect": "1",
+        "format": "json"
+    }
+    resp = requests.get(LASTFM_API_BASE, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    
+    if "error" in data:
+        error_code = data["error"]
+        message = data.get("message", "Unknown error")
+        raise ValueError(f"Last.fm API error {error_code}: {message}")
+    
+    track_obj = data.get("track")
+    if not track_obj:
+        raise ValueError("No track data in response")
+    
+    # Album info
+    album = "N/A"
+    if "album" in track_obj:
+        album = track_obj["album"].get("title", "N/A")
+    
+    # Genre from top tags (first tag)
+    genre = "N/A"
+    toptags = track_obj.get("toptags", {}).get("tag", [])
+    if isinstance(toptags, list) and len(toptags) > 0:
+        genre = toptags[0].get("name", "N/A")
+    elif isinstance(toptags, dict):  # single tag returned as dict
+        genre = toptags.get("name", "N/A")
+    
+    # Cover image (largest available)
+    cover_url = None
+    images = track_obj.get("album", {}).get("image", [])
+    if images:
+        # Sort by size priority and pick the one with highest priority URL
+        best_image = max(images, key=lambda img: SIZE_PRIORITY.get(img.get("size", ""), 0))
+        cover_url = best_image.get("#text")
+    
+    return {
+        "album": album,
+        "genre": genre,
+        "cover_url": cover_url
+    }
 
-    # Build FFmpeg command with complex filter for xfade + acrossfade
-    inputs = []
-    for p in clip_paths:
-        inputs.extend(["-i", str(p)])
-    
-    # Build video xfade filter chain
-    v_filters = []
-    v_last = "0:v"
-    
-    for i in range(1, n):
-        label = f"v{i}"
-        offset = (clip_duration * i) - (transition_duration * i)
-        v_filters.append(f"[{v_last}][{i}:v]xfade=transition=fade:duration={transition_duration}:offset={offset}[{label}]")
-        v_last = label
-    
-    # Build audio acrossfade filter chain
-    a_filters = []
-    a_last = "0:a"
-    
-    for i in range(1, n):
-        label = f"a{i}"
-        a_filters.append(f"[{a_last}][{i}:a]acrossfade=d={transition_duration}:c1=tri:c2=tri[{label}]")
-        a_last = f"a{i}" if i < n - 1 else "a_out"
-    
-    # Rename last audio output
-    if n > 1:
-        a_filters[-1] = a_filters[-1].replace(f"[a{n-1}]", "[a_out]")
-    
-    # Combine all filters
-    all_filters = v_filters + a_filters
-    filter_complex = ";".join(all_filters)
-    
-    # Build final command
+def download_image(url: str, dest: Path):
+    """Download an image from URL and save as PNG."""
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    dest.write_bytes(resp.content)
+
+def create_placeholder_cover(dest: Path):
+    """Generate a black 600x600 PNG placeholder."""
+    from PIL import Image
+    img = Image.new("RGB", (600, 600), color="black")
+    img.save(dest)
+
+def download_excerpt(artist: str, title: str, dest: Path):
+    """
+    Use yt-dlp to download first 15 seconds of official YouTube video.
+    Output is MP3.
+    """
+    query = f"{artist} {title} official audio"
     cmd = [
-        "ffmpeg", "-y",
-        *inputs,
-        "-filter_complex", filter_complex,
-        "-map", f"[{v_last}]",
-        "-map", "[a_out]",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k",
-        "-shortest",
-        str(output_file)
+        "yt-dlp",
+        "--no-playlist",
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "--postprocessor-args", "ffmpeg:-t 15",
+        "-o", str(dest),
+        f"ytsearch1:{query}"
     ]
-    
-    logger.info("Assembling final video with transitions")
-    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    if result.returncode != 0:
-        logger.error(f"Failed to assemble video: {result.stderr}")
-    else:
-        logger.info(f"Video successfully assembled: {output_file}")
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+def generate_silent_audio(dest: Path, duration: int = 15):
+    """
+    Generate a silent MP3 file of specified duration using ffmpeg.
+    """
+    cmd = [
+        "ffmpeg", "-y", "-f", "lavfi",
+        "-i", f"anullsrc=r=44100:cl=mono",
+        "-t", str(duration),
+        "-codec:a", "libmp3lame",
+        "-qscale:a", "2",
+        str(dest)
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
