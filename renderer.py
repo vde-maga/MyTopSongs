@@ -1,171 +1,270 @@
+"""Renderer – gera um frame 1920×1080 por música."""
+
 import logging
 import os
 from pathlib import Path
 from typing import List, Optional, Tuple
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
 from fetcher import SongMetadata
 
 logger = logging.getLogger(__name__)
 
-# -------------------------------------------------------------------
-# Configuração de fonte personalizada
-# Coloque um ficheiro .ttf na raiz do projeto com o nome 'font.ttf'
-# ou defina a variável de ambiente FONT_PATH para outro caminho.
-# -------------------------------------------------------------------
-CUSTOM_FONT_PATH = Path(os.environ.get("FONT_PATH", "font.ttf"))
+__all__ = ["render_frames", "create_frame", "FontNotFoundError"]
+
+
+# ---------------------------------------------------------------------------
+# Configuração
+# ---------------------------------------------------------------------------
+FONTS_DIR = Path("fonts")
+DEFAULT_FONT_FILENAME = "font.ttf"
+FONT_ENV_VAR = "FONT_PATH"
+
+FRAME_WIDTH = 1920
+FRAME_HEIGHT = 1080
 
 # Tamanhos de fonte (escala 1080p)
-TITLE_SIZE = 96       # para "#01" e nome da música
-ARTIST_SIZE = 60      # artista
-INFO_SIZE = 44        # ano | género | álbum
-RATING_SIZE = 44      # ratings
+TITLE_SIZE = 96
+ARTIST_SIZE = 60
+INFO_SIZE = 44
+RATING_SIZE = 44
 
-# Cores
-COLOR_POSITION = (255, 255, 255)     # branco
-COLOR_TITLE = (255, 215, 0)          # amarelo ouro
-COLOR_ARTIST = (240, 240, 240)       # quase branco
-COLOR_INFO = (190, 190, 190)         # cinza claro
-COLOR_RATING = (200, 200, 200)       # cinza claro
-COLOR_SHADOW = (0, 0, 0)             # preto para sombra
+# Cores (R, G, B)
+COLOR_POSITION = (255, 255, 255)
+COLOR_TITLE = (255, 215, 0)
+COLOR_ARTIST = (240, 240, 240)
+COLOR_INFO = (190, 190, 190)
+COLOR_RATING = (200, 200, 200)
+COLOR_SHADOW = (0, 0, 0)
+COLOR_BG_FALLBACK = (30, 30, 30)
+COLOR_COVER_PLACEHOLDER = (0, 0, 0)
 
-# Deslocamento da sombra (pixels)
+# Layout
+COVER_SIZE = 800
+COVER_POS = (80, 140)
+TEXT_MARGIN_LEFT = 80
 SHADOW_OFFSET = (3, 3)
+TEXT_START_Y = 180
+SPACING_AFTER_TITLE = 20
+SPACING_AFTER_ARTIST = 40
+SPACING_AFTER_INFO = 40
 
-def _find_system_font(bold: bool = True) -> Optional[str]:
-    """Procura uma fonte de sistema aceitável, com preferência para DejaVu/Arial."""
-    candidates = []
-    if bold:
-        candidates = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",   # Linux
-            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",              # Arch
-            "/System/Library/Fonts/Helvetica.ttc",                   # macOS (negrito index 1)
-            "C:\\Windows\\Fonts\\arialbd.ttf",                       # Windows
-            "C:\\Windows\\Fonts\\segoeuib.ttf",                      # Windows moderno
-        ]
-    else:
-        candidates = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/TTF/DejaVuSans.ttf",
-            "/System/Library/Fonts/Helvetica.ttc",
-            "C:\\Windows\\Fonts\\arial.ttf",
-            "C:\\Windows\\Fonts\\segoeui.ttf",
-        ]
-    for path_str in candidates:
-        p = Path(path_str)
-        if p.exists():
-            return str(p)
-    return None
 
-def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+# ---------------------------------------------------------------------------
+# Exceções
+# ---------------------------------------------------------------------------
+class FontNotFoundError(FileNotFoundError):
+    """O ficheiro .ttf requerido não foi encontrado."""
+
+
+# ---------------------------------------------------------------------------
+# Fonte
+# ---------------------------------------------------------------------------
+def resolve_font_path() -> Path:
+    """Resolve o caminho para o ficheiro .ttf fornecido pelo utilizador.
+
+    Ordem de procura:
+      1. Variável de ambiente ``FONT_PATH``.
+      2. ``fonts/font.ttf`` na raiz do projeto.
+
+    Raises:
+        FontNotFoundError: Nenhum ficheiro de fonte válido encontrado.
     """
-    Carrega uma fonte com o tamanho especificado.
-    Prioridade: 1) FONTE_PERSONALIZADA (se existir)
-                 2) Fonte de sistema de alta qualidade
-                 3) Fonte padrão do PIL (fallback, baixa qualidade)
+    env_path = os.environ.get(FONT_ENV_VAR)
+    if env_path:
+        path = Path(env_path)
+        if path.is_file():
+            return path
+        raise FontNotFoundError(
+            f"Fonte não encontrada em FONT_PATH='{env_path}'. "
+            f"Coloque um ficheiro .ttf válido nesse caminho."
+        )
+
+    default_path = FONTS_DIR / DEFAULT_FONT_FILENAME
+    if default_path.is_file():
+        return default_path
+
+    raise FontNotFoundError(
+        f"Fonte não encontrada em '{default_path}'. "
+        f"Coloque um ficheiro .ttf nesse diretório (deve suportar Unicode/CJK) "
+        f"ou defina a variável de ambiente {FONT_ENV_VAR}."
+    )
+
+
+def load_font(size: int, font_path: Path) -> ImageFont.FreeTypeFont:
+    """Carrega uma fonte TrueType com o tamanho especificado.
+
+    Args:
+        size: Tamanho da fonte em pontos.
+        font_path: Caminho para o ficheiro .ttf.
+
+    Raises:
+        FontNotFoundError: O ficheiro não pôde ser carregado pelo PIL.
     """
-    if CUSTOM_FONT_PATH.exists():
-        try:
-            return ImageFont.truetype(str(CUSTOM_FONT_PATH), size)
-        except Exception as e:
-            logger.warning(f"Erro ao carregar fonte personalizada: {e}")
-
-    # Fallback para fonte de sistema (negrito ou normal)
-    sys_font = _find_system_font(bold)
-    if sys_font:
-        try:
-            return ImageFont.truetype(sys_font, size)
-        except Exception:
-            pass
-
-    # Último recurso – a fonte padrão do PIL (feia, mas funcional)
-    logger.warning("Usando fonte padrão do PIL (baixa qualidade). Instale 'DejaVu' ou forneça uma 'font.ttf'.")
-    return ImageFont.load_default()
-
-def render_frames(metadatas: List[SongMetadata], frames_dir: Path):
-    """Gera um frame 1920x1080 por música e guarda em frames_dir."""
-    frames_dir.mkdir(parents=True, exist_ok=True)
-    for meta in metadatas:
-        frame_path = frames_dir / f"{meta.position:02d}.png"
-        create_frame(meta, frame_path)
-
-def create_frame(meta: SongMetadata, output_path: Path) -> None:
-    """
-    Cria um frame individual com:
-    - Fundo desfocado da capa (ou cinza escuro)
-    - Capa do álbum à esquerda (800x800)
-    - Textos à direita com sombra para legibilidade
-    """
-    # Carregar fontes
-    font_title = load_font(TITLE_SIZE, bold=True)
-    font_artist = load_font(ARTIST_SIZE, bold=False)
-    font_info = load_font(INFO_SIZE, bold=False)
-    font_rating = load_font(RATING_SIZE, bold=False)
-
-    # Criar tela base
-    bg = Image.new("RGB", (1920, 1080), color=(30, 30, 30))
-
-    # Fundo desfocado se a capa existir
     try:
-        if meta.cover_path and Path(meta.cover_path).exists():
-            cover = Image.open(meta.cover_path).convert("RGB")
-            # Redimensionar para preencher o ecrã
-            cover = cover.resize((1920, 1080), Image.Resampling.LANCZOS)
-            cover = cover.filter(ImageFilter.GaussianBlur(radius=30))
-            bg.paste(cover)
-    except Exception:
-        pass  # mantém fundo escuro
+        return ImageFont.truetype(str(font_path), size)
+    except OSError as exc:
+        raise FontNotFoundError(
+            f"Falha ao carregar fonte '{font_path}': {exc}"
+        ) from exc
 
-    # Capa do álbum (800x800) à esquerda
-    cover_size = 800
-    cover_pos_x, cover_pos_y = 80, 140  # posição vertical centrada
 
-    # Criar miniatura da capa
-    thumbnail = Image.new("RGB", (cover_size, cover_size), color="black")
+# ---------------------------------------------------------------------------
+# Helpers de imagem
+# ---------------------------------------------------------------------------
+def _load_cover_image(cover_path: Optional[str]) -> Optional[Image.Image]:
+    """Carrega a imagem de capa e converte para RGB.
+
+    Retorna ``None`` se *cover_path* estiver em falta ou o ficheiro
+    não puder ser lido.
+    """
+    if not cover_path:
+        return None
+
+    path = Path(cover_path)
+    if not path.is_file():
+        logger.warning("Capa não encontrada: %s", path)
+        return None
+
     try:
-        if meta.cover_path and Path(meta.cover_path).exists():
-            src = Image.open(meta.cover_path).convert("RGB")
-            src = src.resize((cover_size, cover_size), Image.Resampling.LANCZOS)
-            thumbnail = src
-    except Exception:
-        pass
+        with Image.open(path) as img:
+            return img.convert("RGB")
+    except Exception as exc:  # PIL pode lançar várias exceções
+        logger.warning("Falha ao carregar capa '%s': %s", path, exc)
+        return None
 
-    bg.paste(thumbnail, (cover_pos_x, cover_pos_y))
 
-    # Área de texto (coluna direita)
+def _create_background(cover: Optional[Image.Image]) -> Image.Image:
+    """Cria o fundo do frame: capa desfocada ou cinzento escuro."""
+    bg = Image.new("RGB", (FRAME_WIDTH, FRAME_HEIGHT), color=COLOR_BG_FALLBACK)
+
+    if cover is None:
+        return bg
+
+    try:
+        blurred = cover.resize(
+            (FRAME_WIDTH, FRAME_HEIGHT), Image.Resampling.LANCZOS
+        )
+        blurred = blurred.filter(ImageFilter.GaussianBlur(radius=30))
+        bg.paste(blurred)
+    except Exception as exc:
+        logger.warning("Falha ao criar fundo desfocado: %s", exc)
+
+    return bg
+
+
+def _create_thumbnail(cover: Optional[Image.Image]) -> Image.Image:
+    """Redimensiona a capa para COVER_SIZE × COVER_SIZE, ou retorna placeholder."""
+    if cover is None:
+        return Image.new(
+            "RGB", (COVER_SIZE, COVER_SIZE), color=COLOR_COVER_PLACEHOLDER
+        )
+    return cover.resize((COVER_SIZE, COVER_SIZE), Image.Resampling.LANCZOS)
+
+
+# ---------------------------------------------------------------------------
+# Desenho de texto
+# ---------------------------------------------------------------------------
+def draw_text_with_shadow(
+    draw: ImageDraw.ImageDraw,
+    position: Tuple[int, int],
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    fill: Tuple[int, int, int],
+    shadow_fill: Tuple[int, int, int] = COLOR_SHADOW,
+    shadow_offset: Tuple[int, int] = SHADOW_OFFSET,
+) -> None:
+    """Desenha *text* em *position* com sombra para legibilidade."""
+    shadow_pos = (
+        position[0] + shadow_offset[0],
+        position[1] + shadow_offset[1],
+    )
+    draw.text(shadow_pos, text, font=font, fill=shadow_fill)
+    draw.text(position, text, font=font, fill=fill)
+
+
+# ---------------------------------------------------------------------------
+# Criação de frames
+# ---------------------------------------------------------------------------
+def create_frame(
+    meta: SongMetadata, output_path: Path, font_path: Path
+) -> None:
+    """Cria um frame individual 1920×1080 para uma música.
+
+    Layout:
+      - Fundo desfocado da capa (ou cinzento escuro)
+      - Thumbnail da capa à esquerda
+      - Metadados à direita com sombra
+
+    Args:
+        meta: Metadados da música.
+        output_path: Caminho onde guardar o PNG.
+        font_path: Caminho para o ficheiro .ttf.
+
+    Raises:
+        FontNotFoundError: Se a fonte não puder ser carregada.
+    """
+    font_title = load_font(TITLE_SIZE, font_path)
+    font_artist = load_font(ARTIST_SIZE, font_path)
+    font_info = load_font(INFO_SIZE, font_path)
+    font_rating = load_font(RATING_SIZE, font_path)
+
+    cover = _load_cover_image(meta.cover_path)
+
+    bg = _create_background(cover)
+    bg.paste(_create_thumbnail(cover), COVER_POS)
+
     draw = ImageDraw.Draw(bg)
-    x = cover_pos_x + cover_size + 80   # margem entre capa e texto
-    y = 180
+    x = COVER_POS[0] + COVER_SIZE + TEXT_MARGIN_LEFT
+    y = TEXT_START_Y
 
-    # Função auxiliar para desenhar texto com sombra
-    def draw_text_with_shadow(xy, text, font, color, shadow_color=COLOR_SHADOW, offset=SHADOW_OFFSET):
-        # Sombra
-        draw.text((xy[0] + offset[0], xy[1] + offset[1]), text, font=font, fill=shadow_color)
-        # Texto principal
-        draw.text(xy, text, font=font, fill=color)
+    # Posição
+    draw_text_with_shadow(
+        draw, (x, y), f"#{meta.position:02d}", font_title, COLOR_POSITION
+    )
+    y += TITLE_SIZE + SPACING_AFTER_TITLE
 
-    # 1. Número da posição (#01)
-    draw_text_with_shadow((x, y), f"#{meta.position:02d}", font_title, COLOR_POSITION)
-    y += TITLE_SIZE + 20
+    # Título
+    draw_text_with_shadow(
+        draw, (x, y), meta.title, font_title, COLOR_TITLE
+    )
+    y += TITLE_SIZE + SPACING_AFTER_TITLE
 
-    # 2. Título da música
-    draw_text_with_shadow((x, y), meta.title, font_title, COLOR_TITLE)
-    y += TITLE_SIZE + 20
+    # Artista
+    draw_text_with_shadow(
+        draw, (x, y), meta.artist, font_artist, COLOR_ARTIST
+    )
+    y += ARTIST_SIZE + SPACING_AFTER_ARTIST
 
-    # 3. Artista
-    draw_text_with_shadow((x, y), meta.artist, font_artist, COLOR_ARTIST)
-    y += ARTIST_SIZE + 40
-
-    # 4. Linha informativa (Ano | Género | Álbum)
+    # Ano | Género | Álbum
     info_text = f"{meta.year}  |  {meta.genre}  |  {meta.album}"
-    draw_text_with_shadow((x, y), info_text, font_info, COLOR_INFO)
-    y += INFO_SIZE + 40
+    draw_text_with_shadow(draw, (x, y), info_text, font_info, COLOR_INFO)
+    y += INFO_SIZE + SPACING_AFTER_INFO
 
-    # 5. Ratings (RYM e AOTY)
+    # Ratings
     if meta.rym_rating != "N/A" or meta.aoty_rating != "N/A":
         rating_text = f"RYM: {meta.rym_rating}   AOTY: {meta.aoty_rating}"
     else:
         rating_text = "Ratings: N/A"
-    draw_text_with_shadow((x, y), rating_text, font_rating, COLOR_RATING)
+    draw_text_with_shadow(
+        draw, (x, y), rating_text, font_rating, COLOR_RATING
+    )
 
-    # Guardar frame
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     bg.save(output_path)
+
+
+def render_frames(metadatas: List[SongMetadata], frames_dir: Path) -> None:
+    """Gera um frame 1920×1080 por música e guarda em *frames_dir*.
+
+    Raises:
+        FontNotFoundError: Se nenhum ficheiro de fonte estiver disponível.
+    """
+    font_path = resolve_font_path()
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    for meta in metadatas:
+        frame_path = frames_dir / f"{meta.position:02d}.png"
+        create_frame(meta, frame_path, font_path)
+        logger.info("Frame renderizado: %s", frame_path)
