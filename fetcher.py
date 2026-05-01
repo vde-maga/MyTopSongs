@@ -8,6 +8,9 @@ from typing import List, Dict, Optional
 from dataclasses import dataclass
 from parser import SongInput
 from urllib.parse import quote
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
