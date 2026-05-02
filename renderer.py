@@ -40,22 +40,26 @@ COLOR_SHADOW = (0, 0, 0)
 COLOR_BG_FALLBACK = (30, 30, 30)
 COLOR_COVER_PLACEHOLDER = (0, 0, 0)
 
-# Layout
+# Layout - Posições
 COVER_SIZE = 800
 COVER_POS = (80, 140)
 TEXT_MARGIN_LEFT = 80
-SHADOW_OFFSET = (3, 3)
 TEXT_START_Y = 180
+
+# Layout - Espaçamentos verticais
+SHADOW_OFFSET = (3, 3)
+SPACING_AFTER_POSITION = 20
 SPACING_AFTER_TITLE = 20
 SPACING_AFTER_ARTIST = 40
-SPACING_AFTER_INFO = 40
+SPACING_AFTER_INFO_LINE = 20
+SPACING_BEFORE_RATINGS = 40
 
 
 # ---------------------------------------------------------------------------
 # Exceções
 # ---------------------------------------------------------------------------
 class FontNotFoundError(FileNotFoundError):
-    """O ficheiro .ttf requerido não foi encontrado."""
+    """O ficheiro .ttf/.ttc requerido não foi encontrado."""
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +85,6 @@ def resolve_font_path() -> Path:
             f"Coloque um ficheiro .ttf/.ttc válido nesse caminho."
         )
 
-    # Procura tanto .ttf como .ttc na pasta local
     for filename in ("font.ttf", "font.ttc"):
         default_path = FONTS_DIR / filename
         if default_path.is_file():
@@ -103,8 +106,6 @@ def load_font(size: int, font_path: Path) -> ImageFont.FreeTypeFont:
         FontNotFoundError: O ficheiro não pôde ser carregado pelo PIL.
     """
     try:
-        # O argumento 'index' é necessário para ficheiros .ttc.
-        # Para .ttf normais, o index=0 é ignorado de forma segura.
         return ImageFont.truetype(str(font_path), size, index=0)
     except OSError as exc:
         raise FontNotFoundError(
@@ -132,7 +133,7 @@ def _load_cover_image(cover_path: Optional[str]) -> Optional[Image.Image]:
     try:
         with Image.open(path) as img:
             return img.convert("RGB")
-    except Exception as exc:  # PIL pode lançar várias exceções
+    except Exception as exc:
         logger.warning("Falha ao carregar capa '%s': %s", path, exc)
         return None
 
@@ -194,15 +195,10 @@ def create_frame(
 ) -> None:
     """Cria um frame individual 1920×1080 para uma música.
 
-    Layout:
-      - Fundo desfocado da capa (ou cinzento escuro)
-      - Thumbnail da capa à esquerda
-      - Metadados à direita com sombra
-
     Args:
         meta: Metadados da música.
         output_path: Caminho onde guardar o PNG.
-        font_path: Caminho para o ficheiro .ttf.
+        font_path: Caminho para o ficheiro .ttf/.ttc.
 
     Raises:
         FontNotFoundError: Se a fonte não puder ser carregada.
@@ -221,30 +217,43 @@ def create_frame(
     x = COVER_POS[0] + COVER_SIZE + TEXT_MARGIN_LEFT
     y = TEXT_START_Y
 
-    # Posição
+    # 1. Número da posição (#01)
     draw_text_with_shadow(
         draw, (x, y), f"#{meta.position:02d}", font_title, COLOR_POSITION
     )
-    y += TITLE_SIZE + SPACING_AFTER_TITLE
+    y += TITLE_SIZE + SPACING_AFTER_POSITION
 
-    # Título
+    # 2. Título da música
     draw_text_with_shadow(
         draw, (x, y), meta.title, font_title, COLOR_TITLE
     )
     y += TITLE_SIZE + SPACING_AFTER_TITLE
 
-    # Artista
+    # 3. Artista
     draw_text_with_shadow(
         draw, (x, y), meta.artist, font_artist, COLOR_ARTIST
     )
     y += ARTIST_SIZE + SPACING_AFTER_ARTIST
 
-    # Ano | Género | Álbum
-    info_text = f"{meta.year}  |  {meta.genre}  |  {meta.album}"
-    draw_text_with_shadow(draw, (x, y), info_text, font_info, COLOR_INFO)
-    y += INFO_SIZE + SPACING_AFTER_INFO
+    # 4. Álbum
+    draw_text_with_shadow(
+        draw, (x, y), f"Álbum: {meta.album}", font_info, COLOR_INFO
+    )
+    y += INFO_SIZE + SPACING_AFTER_INFO_LINE
 
-    # Ratings
+    # 5. Ano de lançamento
+    draw_text_with_shadow(
+        draw, (x, y), f"Ano: {meta.year}", font_info, COLOR_INFO
+    )
+    y += INFO_SIZE + SPACING_AFTER_INFO_LINE
+
+    # 6. Tags (Género)
+    draw_text_with_shadow(
+        draw, (x, y), f"Tags: {meta.genre}", font_info, COLOR_INFO
+    )
+    y += INFO_SIZE + SPACING_BEFORE_RATINGS
+
+    # 7. Ratings
     if meta.rym_rating != "N/A" or meta.aoty_rating != "N/A":
         rating_text = f"RYM: {meta.rym_rating}   AOTY: {meta.aoty_rating}"
     else:
