@@ -2,8 +2,10 @@
 import sys
 import logging
 from pathlib import Path
+
+from dotenv import load_dotenv
 from parser import parse_songs
-from fetcher import fetch_all
+from fetcher import fetch_all, ApiKeyError  # Importar a exceção customizada
 from renderer import render_frames
 from assembler import assemble_video
 
@@ -19,6 +21,10 @@ def check_dependencies():
 
 def main(input_file: str = "input.txt", output_video: str = "output.mp4"):
     check_dependencies()
+    
+    # Carrega as variáveis do .env para os.environ o mais cedo possível
+    load_dotenv()  
+    
     input_path = Path(input_file)
     logger.info(f"Parsing {input_path}")
     songs = parse_songs(input_path)
@@ -28,7 +34,12 @@ def main(input_file: str = "input.txt", output_video: str = "output.mp4"):
     tmp_dir.mkdir(exist_ok=True)
 
     logger.info("Fetching metadata, covers, and audio excerpts...")
-    metadatas = fetch_all(songs, tmp_dir)
+    try:
+        metadatas = fetch_all(songs, tmp_dir)
+    except ApiKeyError as e:
+        # Se a API key não estiver no .env, falhamos graciosamente com uma mensagem clara
+        logger.critical(f"Configuration error: {e}")
+        sys.exit(1)
 
     logger.info("Rendering frames...")
     frames_dir = tmp_dir / "frames"
