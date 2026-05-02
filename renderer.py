@@ -62,11 +62,11 @@ class FontNotFoundError(FileNotFoundError):
 # Fonte
 # ---------------------------------------------------------------------------
 def resolve_font_path() -> Path:
-    """Resolve o caminho para o ficheiro .ttf fornecido pelo utilizador.
+    """Resolve o caminho para o ficheiro de fonte fornecido pelo utilizador.
 
     Ordem de procura:
       1. Variável de ambiente ``FONT_PATH``.
-      2. ``fonts/font.ttf`` na raiz do projeto.
+      2. ``fonts/font.ttf`` ou ``fonts/font.ttc`` na raiz do projeto.
 
     Raises:
         FontNotFoundError: Nenhum ficheiro de fonte válido encontrado.
@@ -78,16 +78,18 @@ def resolve_font_path() -> Path:
             return path
         raise FontNotFoundError(
             f"Fonte não encontrada em FONT_PATH='{env_path}'. "
-            f"Coloque um ficheiro .ttf válido nesse caminho."
+            f"Coloque um ficheiro .ttf/.ttc válido nesse caminho."
         )
 
-    default_path = FONTS_DIR / DEFAULT_FONT_FILENAME
-    if default_path.is_file():
-        return default_path
+    # Procura tanto .ttf como .ttc na pasta local
+    for filename in ("font.ttf", "font.ttc"):
+        default_path = FONTS_DIR / filename
+        if default_path.is_file():
+            return default_path
 
     raise FontNotFoundError(
-        f"Fonte não encontrada em '{default_path}'. "
-        f"Coloque um ficheiro .ttf nesse diretório (deve suportar Unicode/CJK) "
+        f"Nenhuma fonte encontrada em '{FONTS_DIR}/'. "
+        f"Coloque um ficheiro .ttf ou .ttc (com suporte Unicode/CJK) nesse diretório "
         f"ou defina a variável de ambiente {FONT_ENV_VAR}."
     )
 
@@ -95,15 +97,15 @@ def resolve_font_path() -> Path:
 def load_font(size: int, font_path: Path) -> ImageFont.FreeTypeFont:
     """Carrega uma fonte TrueType com o tamanho especificado.
 
-    Args:
-        size: Tamanho da fonte em pontos.
-        font_path: Caminho para o ficheiro .ttf.
+    Suporta ficheiros .ttf, .otf e .ttc (neste caso, usa o índice 0).
 
     Raises:
         FontNotFoundError: O ficheiro não pôde ser carregado pelo PIL.
     """
     try:
-        return ImageFont.truetype(str(font_path), size)
+        # O argumento 'index' é necessário para ficheiros .ttc.
+        # Para .ttf normais, o index=0 é ignorado de forma segura.
+        return ImageFont.truetype(str(font_path), size, index=0)
     except OSError as exc:
         raise FontNotFoundError(
             f"Falha ao carregar fonte '{font_path}': {exc}"
