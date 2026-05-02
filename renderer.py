@@ -24,7 +24,7 @@ FONT_ENV_VAR = "FONT_PATH"
 FRAME_WIDTH = 1920
 FRAME_HEIGHT = 1080
 
-# Tamanhos de fonte (escala 1080p)
+# Tamanhos de fonte base (escala 1080p)
 TITLE_SIZE = 96
 ARTIST_SIZE = 60
 INFO_SIZE = 44
@@ -40,11 +40,13 @@ COLOR_SHADOW = (0, 0, 0)
 COLOR_BG_FALLBACK = (30, 30, 30)
 COLOR_COVER_PLACEHOLDER = (0, 0, 0)
 
-# Layout - Posições
+# Layout - Posições e Margens
 COVER_SIZE = 800
 COVER_POS = (80, 140)
 TEXT_MARGIN_LEFT = 80
+RIGHT_MARGIN = 80
 TEXT_START_Y = 180
+BOTTOM_MARGIN = 40      # Margem de segurança inferior
 
 # Layout - Espaçamentos verticais
 SHADOW_OFFSET = (3, 3)
@@ -53,6 +55,7 @@ SPACING_AFTER_TITLE = 20
 SPACING_AFTER_ARTIST = 40
 SPACING_AFTER_INFO_LINE = 20
 SPACING_BEFORE_RATINGS = 40
+LINE_SPACING = 10
 
 
 # ---------------------------------------------------------------------------
@@ -66,15 +69,7 @@ class FontNotFoundError(FileNotFoundError):
 # Fonte
 # ---------------------------------------------------------------------------
 def resolve_font_path() -> Path:
-    """Resolve o caminho para o ficheiro de fonte fornecido pelo utilizador.
-
-    Ordem de procura:
-      1. Variável de ambiente ``FONT_PATH``.
-      2. ``fonts/font.ttf`` ou ``fonts/font.ttc`` na raiz do projeto.
-
-    Raises:
-        FontNotFoundError: Nenhum ficheiro de fonte válido encontrado.
-    """
+    """Resolve o caminho para o ficheiro de fonte fornecido pelo utilizador."""
     env_path = os.environ.get(FONT_ENV_VAR)
     if env_path:
         path = Path(env_path)
@@ -92,19 +87,14 @@ def resolve_font_path() -> Path:
 
     raise FontNotFoundError(
         f"Nenhuma fonte encontrada em '{FONTS_DIR}/'. "
-        f"Coloque um ficheiro .ttf ou .ttc (com suporte Unicode/CJK) nesse diretório "
+        f"Coloque um ficheiro .ttf ou .ttc nesse diretório "
         f"ou defina a variável de ambiente {FONT_ENV_VAR}."
     )
 
 
 def load_font(size: int, font_path: Path) -> ImageFont.FreeTypeFont:
-    """Carrega uma fonte TrueType com o tamanho especificado.
-
-    Suporta ficheiros .ttf, .otf e .ttc (neste caso, usa o índice 0).
-
-    Raises:
-        FontNotFoundError: O ficheiro não pôde ser carregado pelo PIL.
-    """
+    """Carrega uma fonte TrueType com o tamanho especificado."""
+    size = max(8, size)  # Defensivo: nunca permitir fontes invisíveis
     try:
         return ImageFont.truetype(str(font_path), size, index=0)
     except OSError as exc:
@@ -117,11 +107,7 @@ def load_font(size: int, font_path: Path) -> ImageFont.FreeTypeFont:
 # Helpers de imagem
 # ---------------------------------------------------------------------------
 def _load_cover_image(cover_path: Optional[str]) -> Optional[Image.Image]:
-    """Carrega a imagem de capa e converte para RGB.
-
-    Retorna ``None`` se *cover_path* estiver em falta ou o ficheiro
-    não puder ser lido.
-    """
+    """Carrega a imagem de capa e converte para RGB."""
     if not cover_path:
         return None
 
@@ -167,8 +153,61 @@ def _create_thumbnail(cover: Optional[Image.Image]) -> Image.Image:
 
 
 # ---------------------------------------------------------------------------
-# Desenho de texto
+# Desenho de texto (com Word Wrap dinâmico)
 # ---------------------------------------------------------------------------
+def _wrap_text(
+    text: str, font: ImageFont.FreeTypeFont, max_width: int
+) -> List[str]:
+    """Quebra o texto em múltiplas linhas para não exceder *max_width*."""
+    if not text:
+        return [""]
+
+    lines = []
+    current_line = ""
+
+    for char in text:
+        test_line = current_line + char
+        bbox = font.getbbox(test_line)
+        line_width = bbox[2] - bbox[0]
+
+        if line_width <= max_width:
+            current_line = test_line
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = char
+
+    if current_line:
+        lines.append(current_line)
+
+    return lines if lines else [text]
+
+
+def draw_text_block_with_shadow(
+    draw: ImageDraw.ImageDraw,
+    position: Tuple[int, int],
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    fill: Tuple[int, int, int],
+    max_width: int,
+    shadow_fill: Tuple[int, int, int] = COLOR_SHADOW,
+    shadow_offset: Tuple[int, int] = SHADOW_OFFSET,
+    line_spacing: int = LINE_SPACING,
+) -> int:
+    """Desenha um bloco de texto com sombra e retorna a nova posição Y."""
+    lines = _wrap_text(text, font, max_width)
+    x, y = position
+    font_height = sum(font.getmetrics())
+
+    for i, line in enumerate(lines):
+        draw_text_with_shadow(draw, (x, y), line, font, fill, shadow_fill, shadow_offset)
+        y += font_height
+        if i < len(lines) - 1:
+            y += line_spacing
+
+    return y
+
+
 def draw_text_with_shadow(
     draw: ImageDraw.ImageDraw,
     position: Tuple[int, int],
@@ -188,28 +227,66 @@ def draw_text_with_shadow(
 
 
 # ---------------------------------------------------------------------------
-# Criação de frames
+# Medição e Criação de frames
 # ---------------------------------------------------------------------------
+def _measure_required_height(
+    elements: List[dict], font_path: Path, max_width: int, scale: float = 1.0
+) -> int:
+    """Calcula a altura total requerida para desenhar todos os elementos."""
+    total_height = 0
+    for i, el in enumerate(elements):
+        size = int(el["size"] * scale)
+        font = load_font(size, font_path)
+        lines = _wrap_text(el["text"], font, max_width)
+        font_height = sum(font.getmetrics())
+        
+        # Altura do bloco de texto
+        total_height += len(lines) * font_height + max(0, len(lines) - 1) * int(LINE_SPACING * scale)
+        
+        # Espaçamento após o bloco (exceto o último)
+        if i < len(elements) - 1:
+            total_height += int(el["space"] * scale)
+            
+    return total_height
+
+
 def create_frame(
     meta: SongMetadata, output_path: Path, font_path: Path
 ) -> None:
-    """Cria um frame individual 1920×1080 para uma música.
+    """Cria um frame individual 1920×1080 para uma música."""
+    
+    # 1. Preparar estrutura de dados dos textos (DRY)
+    rating_text = (
+        f"RYM: {meta.rym_rating}   AOTY: {meta.aoty_rating}"
+        if meta.rym_rating != "N/A" or meta.aoty_rating != "N/A"
+        else "Ratings: N/A"
+    )
+    
+    elements = [
+        {"text": f"#{meta.position:02d}", "size": TITLE_SIZE, "color": COLOR_POSITION, "space": SPACING_AFTER_POSITION},
+        {"text": meta.title, "size": TITLE_SIZE, "color": COLOR_TITLE, "space": SPACING_AFTER_TITLE},
+        {"text": meta.artist, "size": ARTIST_SIZE, "color": COLOR_ARTIST, "space": SPACING_AFTER_ARTIST},
+        {"text": f"Álbum: {meta.album}", "size": INFO_SIZE, "color": COLOR_INFO, "space": SPACING_AFTER_INFO_LINE},
+        {"text": f"Ano: {meta.year}", "size": INFO_SIZE, "color": COLOR_INFO, "space": SPACING_AFTER_INFO_LINE},
+        {"text": f"Tags: {meta.genre}", "size": INFO_SIZE, "color": COLOR_INFO, "space": SPACING_BEFORE_RATINGS},
+        {"text": rating_text, "size": RATING_SIZE, "color": COLOR_RATING, "space": 0},
+    ]
 
-    Args:
-        meta: Metadados da música.
-        output_path: Caminho onde guardar o PNG.
-        font_path: Caminho para o ficheiro .ttf/.ttc.
+    max_text_width = FRAME_WIDTH - (COVER_POS[0] + COVER_SIZE + TEXT_MARGIN_LEFT) - RIGHT_MARGIN
+    available_height = FRAME_HEIGHT - TEXT_START_Y - BOTTOM_MARGIN
 
-    Raises:
-        FontNotFoundError: Se a fonte não puder ser carregada.
-    """
-    font_title = load_font(TITLE_SIZE, font_path)
-    font_artist = load_font(ARTIST_SIZE, font_path)
-    font_info = load_font(INFO_SIZE, font_path)
-    font_rating = load_font(RATING_SIZE, font_path)
+    # 2. Calcular escala dinâmica para caber no ecrã
+    base_height = _measure_required_height(elements, font_path, max_text_width, scale=1.0)
+    scale = 1.0
+    if base_height > available_height:
+        scale = available_height / base_height
+        logger.info(
+            f"Frame #{meta.position:02d}: Texto longo detectado. "
+            f"A aplicar escala de {scale:.2f} para caber no ecrã."
+        )
 
+    # 3. Renderização
     cover = _load_cover_image(meta.cover_path)
-
     bg = _create_background(cover)
     bg.paste(_create_thumbnail(cover), COVER_POS)
 
@@ -217,61 +294,25 @@ def create_frame(
     x = COVER_POS[0] + COVER_SIZE + TEXT_MARGIN_LEFT
     y = TEXT_START_Y
 
-    # 1. Número da posição (#01)
-    draw_text_with_shadow(
-        draw, (x, y), f"#{meta.position:02d}", font_title, COLOR_POSITION
-    )
-    y += TITLE_SIZE + SPACING_AFTER_POSITION
-
-    # 2. Título da música
-    draw_text_with_shadow(
-        draw, (x, y), meta.title, font_title, COLOR_TITLE
-    )
-    y += TITLE_SIZE + SPACING_AFTER_TITLE
-
-    # 3. Artista
-    draw_text_with_shadow(
-        draw, (x, y), meta.artist, font_artist, COLOR_ARTIST
-    )
-    y += ARTIST_SIZE + SPACING_AFTER_ARTIST
-
-    # 4. Álbum
-    draw_text_with_shadow(
-        draw, (x, y), f"Álbum: {meta.album}", font_info, COLOR_INFO
-    )
-    y += INFO_SIZE + SPACING_AFTER_INFO_LINE
-
-    # 5. Ano de lançamento
-    draw_text_with_shadow(
-        draw, (x, y), f"Ano: {meta.year}", font_info, COLOR_INFO
-    )
-    y += INFO_SIZE + SPACING_AFTER_INFO_LINE
-
-    # 6. Tags (Género)
-    draw_text_with_shadow(
-        draw, (x, y), f"Tags: {meta.genre}", font_info, COLOR_INFO
-    )
-    y += INFO_SIZE + SPACING_BEFORE_RATINGS
-
-    # 7. Ratings
-    if meta.rym_rating != "N/A" or meta.aoty_rating != "N/A":
-        rating_text = f"RYM: {meta.rym_rating}   AOTY: {meta.aoty_rating}"
-    else:
-        rating_text = "Ratings: N/A"
-    draw_text_with_shadow(
-        draw, (x, y), rating_text, font_rating, COLOR_RATING
-    )
+    for i, el in enumerate(elements):
+        size = int(el["size"] * scale)
+        font = load_font(size, font_path)
+        current_line_spacing = int(LINE_SPACING * scale)
+        
+        y = draw_text_block_with_shadow(
+            draw, (x, y), el["text"], font, el["color"], max_text_width, 
+            line_spacing=current_line_spacing
+        )
+        
+        if i < len(elements) - 1:
+            y += int(el["space"] * scale)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     bg.save(output_path)
 
 
 def render_frames(metadatas: List[SongMetadata], frames_dir: Path) -> None:
-    """Gera um frame 1920×1080 por música e guarda em *frames_dir*.
-
-    Raises:
-        FontNotFoundError: Se nenhum ficheiro de fonte estiver disponível.
-    """
+    """Gera um frame 1920×1080 por música e guarda em *frames_dir*."""
     font_path = resolve_font_path()
     frames_dir.mkdir(parents=True, exist_ok=True)
 
