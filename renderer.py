@@ -2,17 +2,17 @@
 
 import logging
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from fetcher import SongMetadata
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["render_frames", "create_frame", "FontNotFoundError"]
-
 
 # ---------------------------------------------------------------------------
 # Configuração
@@ -24,38 +24,40 @@ FONT_ENV_VAR = "FONT_PATH"
 FRAME_WIDTH = 1920
 FRAME_HEIGHT = 1080
 
+# === SWITCH: Capa Redonda ===
+ROUND_COVER = True  
+
 # Tamanhos de fonte base (escala 1080p)
-TITLE_SIZE = 96
-ARTIST_SIZE = 60
-INFO_SIZE = 44
-RATING_SIZE = 44
+POSITION_SIZE = 48
+TITLE_SIZE = 86
+ARTIST_SIZE = 56
+INFO_SIZE = 38
 
 # Cores (R, G, B)
 COLOR_POSITION = (255, 255, 255)
-COLOR_TITLE = (255, 215, 0)
-COLOR_ARTIST = (240, 240, 240)
-COLOR_INFO = (190, 190, 190)
-COLOR_RATING = (200, 200, 200)
-COLOR_SHADOW = (0, 0, 0)
-COLOR_BG_FALLBACK = (30, 30, 30)
-COLOR_COVER_PLACEHOLDER = (0, 0, 0)
+COLOR_TITLE = (45, 24, 41)
+COLOR_ARTIST = (86, 114, 41)
+COLOR_INFO = (159, 183, 234)
+COLOR_BG_FALLBACK = (20, 20, 20)
+COLOR_OVERLAY = (0, 0, 0, 100) # Overlay escuro para contraste do fundo
+
+# Sombra do Texto
+SHADOW_OFFSET = (4, 4)
+SHADOW_BLUR_RADIUS = 6       # Suavidade da sombra (0 = sem blur, 6 = muito suave)
+SHADOW_OPACITY = 0.5         # Opacidade da sombra (0.0 a 1.0) - Reduzido para ser menos presente
 
 # Layout - Posições e Margens
-COVER_SIZE = 800
-COVER_POS = (80, 140)
+COVER_SIZE = 680
 TEXT_MARGIN_LEFT = 80
-RIGHT_MARGIN = 80
-TEXT_START_Y = 180
-BOTTOM_MARGIN = 40      # Margem de segurança inferior
+RIGHT_MARGIN = 100
+BOTTOM_MARGIN = 40
 
 # Layout - Espaçamentos verticais
-SHADOW_OFFSET = (3, 3)
-SPACING_AFTER_POSITION = 20
-SPACING_AFTER_TITLE = 20
-SPACING_AFTER_ARTIST = 40
-SPACING_AFTER_INFO_LINE = 20
-SPACING_BEFORE_RATINGS = 40
-LINE_SPACING = 10
+SPACING_AFTER_POSITION = 15
+SPACING_AFTER_TITLE = 15
+SPACING_AFTER_ARTIST = 30
+SPACING_AFTER_INFO_LINE = 15
+LINE_SPACING = 8
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +68,7 @@ class FontNotFoundError(FileNotFoundError):
 
 
 # ---------------------------------------------------------------------------
-# Fonte
+# Fonte (Com Cache para remover redundância de I/O)
 # ---------------------------------------------------------------------------
 def resolve_font_path() -> Path:
     """Resolve o caminho para o ficheiro de fonte fornecido pelo utilizador."""
@@ -92,22 +94,21 @@ def resolve_font_path() -> Path:
     )
 
 
+@lru_cache(maxsize=32)
 def load_font(size: int, font_path: Path) -> ImageFont.FreeTypeFont:
-    """Carrega uma fonte TrueType com o tamanho especificado."""
-    size = max(8, size)  # Defensivo: nunca permitir fontes invisíveis
+    """Carrega uma fonte TrueType com o tamanho especificado (Com Cache)."""
+    size = max(8, size)
     try:
         return ImageFont.truetype(str(font_path), size, index=0)
     except OSError as exc:
-        raise FontNotFoundError(
-            f"Falha ao carregar fonte '{font_path}': {exc}"
-        ) from exc
+        raise FontNotFoundError(f"Falha ao carregar fonte '{font_path}': {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
 # Helpers de imagem
 # ---------------------------------------------------------------------------
 def _load_cover_image(cover_path: Optional[str]) -> Optional[Image.Image]:
-    """Carrega a imagem de capa e converte para RGB."""
+    """Carrega a imagem de capa e converte para RGBA."""
     if not cover_path:
         return None
 
@@ -118,64 +119,110 @@ def _load_cover_image(cover_path: Optional[str]) -> Optional[Image.Image]:
 
     try:
         with Image.open(path) as img:
-            return img.convert("RGB")
+            return img.convert("RGBA")
     except Exception as exc:
         logger.warning("Falha ao carregar capa '%s': %s", path, exc)
         return None
 
 
 def _create_background(cover: Optional[Image.Image]) -> Image.Image:
-    """Cria o fundo do frame: capa desfocada ou cinzento escuro."""
-    bg = Image.new("RGB", (FRAME_WIDTH, FRAME_HEIGHT), color=COLOR_BG_FALLBACK)
+    """Cria o fundo do frame com overlay escuro para legibilidade."""
+    bg = Image.new("RGBA", (FRAME_WIDTH, FRAME_HEIGHT), color=COLOR_BG_FALLBACK)
 
-    if cover is None:
-        return bg
+    if cover is not None:
+        try:
+            blurred = cover.resize((FRAME_WIDTH, FRAME_HEIGHT), Image.Resampling.LANCZOS)
+            blurred = blurred.filter(ImageFilter.GaussianBlur(radius=40))
+            bg.paste(blurred)
+        except Exception as exc:
+            logger.warning("Falha ao criar fundo desfocado: %s", exc)
 
-    try:
-        blurred = cover.resize(
-            (FRAME_WIDTH, FRAME_HEIGHT), Image.Resampling.LANCZOS
-        )
-        blurred = blurred.filter(ImageFilter.GaussianBlur(radius=30))
-        bg.paste(blurred)
-    except Exception as exc:
-        logger.warning("Falha ao criar fundo desfocado: %s", exc)
+    # Overlay escuro para garantir contraste do texto
+    overlay = Image.new("RGBA", (FRAME_WIDTH, FRAME_HEIGHT), COLOR_OVERLAY)
+    bg = Image.alpha_composite(bg, overlay)
 
     return bg
 
 
-def _create_thumbnail(cover: Optional[Image.Image]) -> Image.Image:
-    """Redimensiona a capa para COVER_SIZE × COVER_SIZE, ou retorna placeholder."""
+def _create_thumbnail(cover: Optional[Image.Image], round_shape: bool) -> Image.Image:
+    """Redimensiona a capa e aplica máscara se necessário."""
+    size = COVER_SIZE
     if cover is None:
-        return Image.new(
-            "RGB", (COVER_SIZE, COVER_SIZE), color=COLOR_COVER_PLACEHOLDER
-        )
-    return cover.resize((COVER_SIZE, COVER_SIZE), Image.Resampling.LANCZOS)
+        img = Image.new("RGBA", (size, size), (30, 30, 30, 255))
+    else:
+        img = cover.resize((size, size), Image.Resampling.LANCZOS)
+
+    if round_shape:
+        # Máscara circular
+        mask = Image.new("L", (size, size), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.ellipse((0, 0, size, size), fill=255)
+        
+        output = ImageOps.fit(img, (size, size), centering=(0.5, 0.5))
+        output.putalpha(mask)
+
+        # Borda sutil
+        border_draw = ImageDraw.Draw(output)
+        border_draw.ellipse([(2, 2), (size - 2, size - 2)], outline=(255, 255, 255, 40), width=3)
+        return output
+    else:
+        # Capa quadrada normal com cantos ligeiramente arredondados (opcional, mas fica bem)
+        # Se quiseres mesmo 100% quadrada, mudar para radius=0
+        mask = Image.new("L", (size, size), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.rounded_rectangle([(0, 0), (size, size)], radius=20, fill=255)
+        img.putalpha(mask)
+        return img
 
 
 # ---------------------------------------------------------------------------
-# Desenho de texto (com Word Wrap dinâmico)
+# Desenho de texto (Apenas Lógica de Wrap, Sem Sombras)
 # ---------------------------------------------------------------------------
-def _wrap_text(
-    text: str, font: ImageFont.FreeTypeFont, max_width: int
-) -> List[str]:
-    """Quebra o texto em múltiplas linhas para não exceder *max_width*."""
-    if not text:
-        return [""]
-
+def _break_long_word(word: str, font: ImageFont.FreeTypeFont, max_width: int) -> List[str]:
     lines = []
     current_line = ""
-
-    for char in text:
+    for char in word:
         test_line = current_line + char
-        bbox = font.getbbox(test_line)
-        line_width = bbox[2] - bbox[0]
-
+        line_width = font.getbbox(test_line)[2]
         if line_width <= max_width:
             current_line = test_line
         else:
             if current_line:
                 lines.append(current_line)
             current_line = char
+    if current_line:
+        lines.append(current_line)
+    return lines if lines else [word]
+
+
+def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> List[str]:
+    if not text:
+        return [""]
+    words = text.split()
+    if not words:
+        return [""]
+
+    lines = []
+    current_line = ""
+
+    for word in words:
+        test_line = f"{current_line} {word}" if current_line else word
+        line_width = font.getbbox(test_line)[2]
+
+        if line_width <= max_width:
+            current_line = test_line
+        else:
+            if current_line:
+                lines.append(current_line)
+                current_line = ""
+            
+            word_width = font.getbbox(word)[2]
+            if word_width <= max_width:
+                current_line = word
+            else:
+                broken = _break_long_word(word, font, max_width)
+                lines.extend(broken[:-1])
+                current_line = broken[-1] if broken else ""
 
     if current_line:
         lines.append(current_line)
@@ -183,47 +230,27 @@ def _wrap_text(
     return lines if lines else [text]
 
 
-def draw_text_block_with_shadow(
+def draw_text_block(
     draw: ImageDraw.ImageDraw,
     position: Tuple[int, int],
     text: str,
     font: ImageFont.FreeTypeFont,
-    fill: Tuple[int, int, int],
+    fill: Tuple[int, ...],
     max_width: int,
-    shadow_fill: Tuple[int, int, int] = COLOR_SHADOW,
-    shadow_offset: Tuple[int, int] = SHADOW_OFFSET,
     line_spacing: int = LINE_SPACING,
 ) -> int:
-    """Desenha um bloco de texto com sombra e retorna a nova posição Y."""
+    """Desenha um bloco de texto (SEM SOMBRA) e retorna a nova posição Y."""
     lines = _wrap_text(text, font, max_width)
     x, y = position
     font_height = sum(font.getmetrics())
 
     for i, line in enumerate(lines):
-        draw_text_with_shadow(draw, (x, y), line, font, fill, shadow_fill, shadow_offset)
+        draw.text((x, y), line, font=font, fill=fill)
         y += font_height
         if i < len(lines) - 1:
             y += line_spacing
 
     return y
-
-
-def draw_text_with_shadow(
-    draw: ImageDraw.ImageDraw,
-    position: Tuple[int, int],
-    text: str,
-    font: ImageFont.FreeTypeFont,
-    fill: Tuple[int, int, int],
-    shadow_fill: Tuple[int, int, int] = COLOR_SHADOW,
-    shadow_offset: Tuple[int, int] = SHADOW_OFFSET,
-) -> None:
-    """Desenha *text* em *position* com sombra para legibilidade."""
-    shadow_pos = (
-        position[0] + shadow_offset[0],
-        position[1] + shadow_offset[1],
-    )
-    draw.text(shadow_pos, text, font=font, fill=shadow_fill)
-    draw.text(position, text, font=font, fill=fill)
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +259,6 @@ def draw_text_with_shadow(
 def _measure_required_height(
     elements: List[dict], font_path: Path, max_width: int, scale: float = 1.0
 ) -> int:
-    """Calcula a altura total requerida para desenhar todos os elementos."""
     total_height = 0
     for i, el in enumerate(elements):
         size = int(el["size"] * scale)
@@ -240,14 +266,34 @@ def _measure_required_height(
         lines = _wrap_text(el["text"], font, max_width)
         font_height = sum(font.getmetrics())
         
-        # Altura do bloco de texto
         total_height += len(lines) * font_height + max(0, len(lines) - 1) * int(LINE_SPACING * scale)
         
-        # Espaçamento após o bloco (exceto o último)
         if i < len(elements) - 1:
             total_height += int(el["space"] * scale)
             
     return total_height
+
+
+def _find_optimal_scale(
+    elements: List[dict], font_path: Path, max_width: int, available_height: int
+) -> float:
+    if _measure_required_height(elements, font_path, max_width, 1.0) <= available_height:
+        return 1.0
+
+    low, high = 0.1, 1.0
+    best_scale = low
+    
+    for _ in range(10):
+        mid = (low + high) / 2
+        current_height = _measure_required_height(elements, font_path, max_width, mid)
+        
+        if current_height <= available_height:
+            best_scale = mid
+            low = mid
+        else:
+            high = mid
+
+    return best_scale
 
 
 def create_frame(
@@ -255,65 +301,118 @@ def create_frame(
 ) -> None:
     """Cria um frame individual 1920×1080 para uma música."""
     
-    # 1. Preparar estrutura de dados dos textos (DRY)
-    rating_text = (
-        f"RYM: {meta.rym_rating}   AOTY: {meta.aoty_rating}"
-        if meta.rym_rating != "N/A" or meta.aoty_rating != "N/A"
-        else "Ratings: N/A"
-    )
-    
     elements = [
-        {"text": f"#{meta.position:02d}", "size": TITLE_SIZE, "color": COLOR_POSITION, "space": SPACING_AFTER_POSITION},
+        {"text": f"#{meta.position:02d}", "size": POSITION_SIZE, "color": COLOR_POSITION, "space": SPACING_AFTER_POSITION},
         {"text": meta.title, "size": TITLE_SIZE, "color": COLOR_TITLE, "space": SPACING_AFTER_TITLE},
         {"text": meta.artist, "size": ARTIST_SIZE, "color": COLOR_ARTIST, "space": SPACING_AFTER_ARTIST},
         {"text": f"Álbum: {meta.album}", "size": INFO_SIZE, "color": COLOR_INFO, "space": SPACING_AFTER_INFO_LINE},
-        {"text": f"Ano: {meta.year}", "size": INFO_SIZE, "color": COLOR_INFO, "space": SPACING_AFTER_INFO_LINE},
-        {"text": f"Tags: {meta.genre}", "size": INFO_SIZE, "color": COLOR_INFO, "space": SPACING_BEFORE_RATINGS},
-        {"text": rating_text, "size": RATING_SIZE, "color": COLOR_RATING, "space": 0},
+        {"text": f"Ano: {meta.year}", "size": INFO_SIZE, "color": COLOR_INFO, "space": 0},
     ]
 
-    max_text_width = FRAME_WIDTH - (COVER_POS[0] + COVER_SIZE + TEXT_MARGIN_LEFT) - RIGHT_MARGIN
-    available_height = FRAME_HEIGHT - TEXT_START_Y - BOTTOM_MARGIN
+    # Calcular limites de texto com base na capa
+    cover_x_start = 100
+    max_text_width = FRAME_WIDTH - (cover_x_start + COVER_SIZE + TEXT_MARGIN_LEFT) - RIGHT_MARGIN
+    available_height = FRAME_HEIGHT - 100 - BOTTOM_MARGIN
 
-    # 2. Calcular escala dinâmica para caber no ecrã
-    base_height = _measure_required_height(elements, font_path, max_text_width, scale=1.0)
-    scale = 1.0
-    if base_height > available_height:
-        scale = available_height / base_height
-        logger.info(
-            f"Frame #{meta.position:02d}: Texto longo detectado. "
-            f"A aplicar escala de {scale:.2f} para caber no ecrã."
-        )
+    # Calcular escala dinâmica
+    scale = _find_optimal_scale(elements, font_path, max_text_width, available_height)
+    
+    if scale < 0.99:
+        logger.info(f"Frame #{meta.position:02d}: Texto longo. Escala {scale:.2f} aplicada.")
 
-    # 3. Renderização
+    # --- RENDERIZAÇÃO ---
     cover = _load_cover_image(meta.cover_path)
     bg = _create_background(cover)
-    bg.paste(_create_thumbnail(cover), COVER_POS)
+    
+    # Posições da Capa
+    cover_pos = (cover_x_start, (FRAME_HEIGHT - COVER_SIZE) // 2)
+    
+    # 1. Desenhar Sombra da Capa (Correspondendo à forma redonda ou quadrada)
+    shadow_layer = Image.new("RGBA", bg.size, (0, 0, 0, 0))
+    shadow_draw = ImageDraw.Draw(shadow_layer)
+    
+    shadow_offset_val = 10
+    if ROUND_COVER:
+        shadow_draw.ellipse(
+            [cover_pos[0] + shadow_offset_val, cover_pos[1] + shadow_offset_val, 
+             cover_pos[0] + COVER_SIZE + shadow_offset_val, cover_pos[1] + COVER_SIZE + shadow_offset_val], 
+            fill=(0, 0, 0, 140)
+        )
+    else:
+        shadow_draw.rounded_rectangle(
+            [cover_pos[0] + shadow_offset_val, cover_pos[1] + shadow_offset_val, 
+             cover_pos[0] + COVER_SIZE + shadow_offset_val, cover_pos[1] + COVER_SIZE + shadow_offset_val], 
+            radius=20, fill=(0, 0, 0, 140)
+        )
+        
+    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=25))
+    bg = Image.alpha_composite(bg, shadow_layer)
+    
+    # 2. Colar a Capa
+    thumbnail = _create_thumbnail(cover, ROUND_COVER)
+    bg.paste(thumbnail, cover_pos, thumbnail)
 
-    draw = ImageDraw.Draw(bg)
-    x = COVER_POS[0] + COVER_SIZE + TEXT_MARGIN_LEFT
-    y = TEXT_START_Y
+    # 3. Preparar Texto e Sombra Profissional
+    x = cover_x_start + COVER_SIZE + TEXT_MARGIN_LEFT
+    total_text_height = _measure_required_height(elements, font_path, max_text_width, scale)
+    cover_center_y = cover_pos[1] + COVER_SIZE // 2
+    y = cover_center_y - total_text_height // 2
 
+    # Criar camada para a sombra do texto
+    shadow_padding = 40  # Para o blur não cortar nas bordas
+    text_shadow_layer = Image.new("RGBA", (max_text_width + shadow_padding * 2, total_text_height + shadow_padding * 2), (0, 0, 0, 0))
+    shadow_draw = ImageDraw.Draw(text_shadow_layer)
+    
+    # Desenhar texto preto na camada de sombra
+    temp_y = shadow_padding
     for i, el in enumerate(elements):
         size = int(el["size"] * scale)
         font = load_font(size, font_path)
         current_line_spacing = int(LINE_SPACING * scale)
         
-        y = draw_text_block_with_shadow(
-            draw, (x, y), el["text"], font, el["color"], max_text_width, 
-            line_spacing=current_line_spacing
+        temp_y = draw_text_block(
+            shadow_draw, (shadow_padding, temp_y), el["text"], font, (0, 0, 0, 255), 
+            max_text_width, line_spacing=current_line_spacing
         )
-        
         if i < len(elements) - 1:
-            y += int(el["space"] * scale)
+            temp_y += int(el["space"] * scale)
 
+    # Aplicar Blur e Opacidade à sombra do texto
+    if SHADOW_BLUR_RADIUS > 0:
+        text_shadow_layer = text_shadow_layer.filter(ImageFilter.GaussianBlur(radius=SHADOW_BLUR_RADIUS))
+    
+    # Reduzir a presença/opacidade da sombra
+    alpha = text_shadow_layer.split()[3]
+    alpha = alpha.point(lambda p: int(p * SHADOW_OPACITY))
+    text_shadow_layer.putalpha(alpha)
+
+    # Colar camada de sombra no fundo principal
+    bg.paste(text_shadow_layer, (x - shadow_padding + SHADOW_OFFSET[0], y - shadow_padding + SHADOW_OFFSET[1]), text_shadow_layer)
+
+    # 4. Desenhar Texto Final (Por cima da sombra, na imagem principal)
+    main_draw = ImageDraw.Draw(bg)
+    curr_y = y
+    for i, el in enumerate(elements):
+        size = int(el["size"] * scale)
+        font = load_font(size, font_path)
+        current_line_spacing = int(LINE_SPACING * scale)
+        
+        curr_y = draw_text_block(
+            main_draw, (x, curr_y), el["text"], font, el["color"], 
+            max_text_width, line_spacing=current_line_spacing
+        )
+        if i < len(elements) - 1:
+            curr_y += int(el["space"] * scale)
+
+    # Converter de volta para RGB e salvar
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    bg.save(output_path)
+    bg.convert("RGB").save(output_path, quality=95)
 
 
 def render_frames(metadatas: List[SongMetadata], frames_dir: Path) -> None:
     """Gera um frame 1920×1080 por música e guarda em *frames_dir*."""
     font_path = resolve_font_path()
+    load_font.cache_clear() 
     frames_dir.mkdir(parents=True, exist_ok=True)
 
     for meta in metadatas:
