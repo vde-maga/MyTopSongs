@@ -337,6 +337,7 @@ def fetch_all(
     output_dir: Path,
     lastfm_api_key: Optional[str] = None,
     *,
+    interactive: bool = False,
     lastfm_client: Optional[LastFmClient] = None,
     itunes_client: Optional[ItunesClient] = None,
 ) -> List[SongMetadata]:
@@ -348,6 +349,7 @@ def fetch_all(
     iTunes   -> year
 
     Fail-safe: placeholders are generated when downloads fail, and flags are set.
+    If interactive=True, prompts the user for cover art when not found.
     """
     if not songs:
         return []
@@ -376,7 +378,7 @@ def fetch_all(
         )
 
         cover_url = _enrich_metadata(meta, song, lastfm_client, itunes_client)
-        _ensure_cover(meta, cover_url, song.position, covers_dir)
+        _ensure_cover(meta, cover_url, song.position, covers_dir, interactive=interactive)
         _ensure_excerpt(meta, song.artist, song.title, song.position, audio_dir)
 
         if meta.cover_is_placeholder or meta.excerpt_is_placeholder:
@@ -424,18 +426,55 @@ def _ensure_cover(
     cover_url: Optional[str],
     position: int,
     covers_dir: Path,
+    interactive: bool = False,
 ) -> None:
-    """Download the cover image or create a descriptive placeholder."""
+    """Download the cover image, ask user for input, or create a placeholder."""
     cover_file = covers_dir / f"{position:02d}.png"
 
+    # ── 1. Try downloading from API ──
     if cover_url:
         try:
             download_image(cover_url, cover_file)
             meta.cover_path = str(cover_file)
             return
         except Exception as exc:
-            logger.error(f"Cover download failed, using placeholder: {exc}")
+            logger.error(f"Cover download from API failed: {exc}")
 
+    # ── 2. Interactive Fallback ──
+    if interactive:
+        print(f"\n❌ Capa não encontrada para: {meta.artist} - {meta.title}")
+        user_input = input(
+            "👉 Insere um URL, o caminho para um ficheiro local, "
+            "ou prime Enter para gerar placeholder: "
+        ).strip().strip("'\"")  # Remove quotes from copy-pasted paths
+
+        if user_input:
+            try:
+                # Check if it's a URL
+                if user_input.lower().startswith(("http://", "https://")):
+                    download_image(user_input, cover_file)
+                # Otherwise, treat as a local file path
+                else:
+                    local_path = Path(user_input).expanduser()  # Handles ~ (home dir)
+                    if not local_path.is_file():
+                        raise FileNotFoundError(f"Ficheiro não encontrado: {local_path}")
+                    
+                    # Open, normalize (remove alpha channel), and save as PNG
+                    img = Image.open(local_path)
+                    if img.mode in ("RGBA", "LA", "P"):
+                        img = img.convert("RGB")
+                    img.save(cover_file, format="PNG")
+
+                # If we reached here, the user's input was successful
+                meta.cover_path = str(cover_file)
+                print("✅ Capa aplicada com sucesso!")
+                return
+
+            except Exception as exc:
+                logger.error(f"Falha ao usar o ficheiro/link fornecido: {exc}")
+                print("⚠️ Não foi possível usar essa imagem. A gerar placeholder...")
+
+    # ── 3. Default: Generate Placeholder ──
     create_placeholder_cover(cover_file, song_title=meta.title, song_artist=meta.artist)
     meta.cover_path = str(cover_file)
     meta.cover_is_placeholder = True
@@ -453,8 +492,6 @@ def _ensure_excerpt(
     try:
         download_excerpt(artist, title, excerpt_file)
         meta.excerpt_path = str(excerpt_file)
-        # Store where the excerpt starts for video editing sync
-        # (In a real scenario, find_best_moment would return this; we save 0.0 if fallback)
     except Exception as exc:
         logger.error(f"Audio excerpt failed, using silent placeholder: {exc}")
         generate_silent_audio(excerpt_file, duration=EXCERPT_DURATION_SEC)
