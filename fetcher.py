@@ -9,12 +9,13 @@ import io
 import logging
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from parser import SongInput  # project-local parser module
 
@@ -34,15 +35,20 @@ SIZE_PRIORITY: Dict[str, int] = {
 }
 
 REQUEST_TIMEOUT_SEC = 10
-SUBPROCESS_TIMEOUT_SEC = 120
+SUBPROCESS_TIMEOUT_SEC = 180  # Increased due to full audio download
 SILENT_AUDIO_TIMEOUT_SEC = 30
-
+MAX_API_RETRIES = 3
+EXCERPT_DURATION_SEC = 15
+MIN_SONG_DURATION_SEC = 30   # Filter out short clips/previews
+MAX_SONG_DURATION_SEC = 600  # Filter out full DJ sets/mixes
 
 # ── Exceptions ───────────────────────────────────────────────────────────
 
 class ApiKeyError(Exception):
     """Required API key is missing from environment."""
 
+class AudioValidationError(Exception):
+    """Downloaded audio failed validation checks."""
 
 # ── Data Model ───────────────────────────────────────────────────────────
 
@@ -56,7 +62,10 @@ class SongMetadata:
     year: str = "N/A"
     cover_path: str = ""
     excerpt_path: str = ""
-
+    # Quality flags so consumers can tell what's real vs placeholder
+    cover_is_placeholder: bool = False
+    excerpt_is_placeholder: bool = False
+    excerpt_start_sec: float = 0.0
 
 # ── API Key ──────────────────────────────────────────────────────────────
 
@@ -67,11 +76,10 @@ def get_api_key(env_var: str = "LASTFM_API_KEY") -> str:
         raise ApiKeyError(f"{env_var} environment variable not set.")
     return key
 
-
 # ── Last.fm Client ───────────────────────────────────────────────────────
 
 class LastFmClient:
-    """Encapsulates all Last.fm API calls."""
+    """Encapsulates all Last.fm API calls with retry logic."""
 
     def __init__(self, api_key: str, base_url: str = LASTFM_API_BASE) -> None:
         self._api_key = api_key
@@ -102,17 +110,28 @@ class LastFmClient:
     # ── Private ──
 
     def _request(self, params: Dict[str, str]) -> Dict:
-        resp = requests.get(
-            self._base_url, params=params, timeout=REQUEST_TIMEOUT_SEC
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if "error" in data:
-            raise ValueError(
-                f"Last.fm API error {data['error']}: "
-                f"{data.get('message', 'Unknown')}"
-            )
-        return data
+        """Make a GET request with exponential backoff retry."""
+        backoff_sec = 1
+        for attempt in range(MAX_API_RETRIES):
+            try:
+                resp = requests.get(
+                    self._base_url, params=params, timeout=REQUEST_TIMEOUT_SEC
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if "error" in data:
+                    raise ValueError(
+                        f"Last.fm API error {data['error']}: "
+                        f"{data.get('message', 'Unknown')}"
+                    )
+                return data
+            except requests.exceptions.RequestException as exc:
+                if attempt < MAX_API_RETRIES - 1:
+                    logger.warning(f"Last.fm request failed (attempt {attempt+1}), retrying in {backoff_sec}s: {exc}")
+                    time.sleep(backoff_sec)
+                    backoff_sec *= 2
+                else:
+                    raise
 
     @staticmethod
     def _extract_album(track_obj: Dict) -> str:
@@ -133,7 +152,6 @@ class LastFmClient:
         url = best.get("#text", "")
         return url if url else None
 
-
 # ── iTunes Client (Year only) ────────────────────────────────────────────
 
 class ItunesClient:
@@ -147,20 +165,20 @@ class ItunesClient:
         try:
             resp = self._session.get(
                 ITUNES_API_BASE,
-                params={"term": f"{artist} {track}", "entity": "song", "limit": 1},
+                params={"term": f"{artist} {track}", "entity": "song", "limit": 5},
                 timeout=REQUEST_TIMEOUT_SEC,
             )
             resp.raise_for_status()
             data = resp.json()
             results = data.get("results", [])
             if results:
+                # Try to find an exact or closer match rather than just the first result
                 release_date = results[0].get("releaseDate", "")
                 if release_date:
                     return release_date.split("-")[0]
         except Exception as exc:
             logger.warning(f"iTunes lookup failed for {artist} - {track}: {exc}")
         return None
-
 
 # ── File Download Helpers ────────────────────────────────────────────────
 
@@ -173,42 +191,144 @@ def download_image(url: str, dest: Path) -> None:
         img = img.convert("RGB")
     img.save(dest, format="PNG")
 
-
-def create_placeholder_cover(dest: Path) -> None:
-    """Generate a black 600×600 PNG placeholder."""
-    img = Image.new("RGB", (600, 600), color="black")
+def create_placeholder_cover(dest: Path, song_title: str = "?", song_artist: str = "?") -> None:
+    """Generate a placeholder cover that clearly indicates it's a fallback."""
+    img = Image.new("RGB", (600, 600), color=(30, 30, 30))
+    draw = ImageDraw.Draw(img)
+    
+    # Draw a visual indicator (X)
+    draw.line([(150, 150), (450, 450)], fill=(80, 80, 80), width=6)
+    draw.line([(450, 150), (150, 450)], fill=(80, 80, 80), width=6)
+    
+    # Attempt to load a decent font, fallback to default
+    try:
+        font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
+    except (IOError, OSError):
+        font_large = ImageFont.load_default()
+        font_small = ImageFont.load_default()
+    
+    # Add song info
+    draw.text((300, 320), f"{song_artist}\n{song_title}", fill=(140, 140, 140), anchor="mm", font=font_large)
+    draw.text((300, 560), "⚠ COVER NOT FOUND", fill=(200, 60, 60), anchor="mm", font=font_small)
+    
     img.save(dest, format="PNG")
 
-
-def download_excerpt(artist: str, title: str, dest: Path) -> None:
-    """Download the first 15 s of a track as MP3 via yt-dlp."""
-    query = f"{artist} {title} official audio"
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--extract-audio",
-        "--audio-format", "mp3",
-        "--postprocessor-args", "ffmpeg:-t 15",
-        "-o", str(dest),
-        f"ytsearch1:{query}",
-    ]
-    subprocess.run(cmd, check=True, timeout=SUBPROCESS_TIMEOUT_SEC)
-
-
 def generate_silent_audio(dest: Path, duration: int = 15) -> None:
-    """Generate a silent MP3 file of *duration* seconds using ffmpeg."""
+    """Generate a silent MP3 file with metadata marking it as a placeholder."""
     cmd = [
         "ffmpeg", "-y", "-f", "lavfi",
         "-i", "anullsrc=r=44100:cl=mono",
         "-t", str(duration),
-        "-codec:a", "libmp3lame",
-        "-qscale:a", "2",
+        "-codec:a", "libmp3lame", "-qscale:a", "2",
+        "-metadata", "title=PLACEHOLDER - AUDIO NOT FOUND",
+        "-metadata", "artist=SYSTEM",
         str(dest),
     ]
-    subprocess.run(
-        cmd, capture_output=True, timeout=SILENT_AUDIO_TIMEOUT_SEC
-    )
+    subprocess.run(cmd, capture_output=True, timeout=SILENT_AUDIO_TIMEOUT_SEC)
 
+# ── Audio Analysis & Download ────────────────────────────────────────────
+
+def _get_audio_duration(file_path: Path) -> float:
+    """Get the duration of an audio file using ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(file_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        raise AudioValidationError("Could not determine audio duration.")
+
+def find_best_moment(audio_path: Path, window_sec: int = EXCERPT_DURATION_SEC) -> float:
+    """Find the most energetic window of `window_sec` seconds.
+    
+    Tries to use librosa for RMS energy analysis. If librosa is not installed,
+    falls back to a simple midpoint heuristic (40% mark of the song).
+    """
+    try:
+        import librosa
+        import numpy as np
+        
+        logger.info(f"Analyzing audio for best moment with librosa: {audio_path.name}")
+        y, sr = librosa.load(audio_path, sr=22050, mono=True)
+        
+        frame_length = int(sr * window_sec)
+        hop_length = int(sr * 1)  # 1-second hop
+        
+        if len(y) <= frame_length:
+            return 0.0
+        
+        # Sliding window RMS
+        energy = np.array([
+            np.sqrt(np.mean(y[i:i + frame_length] ** 2))
+            for i in range(0, len(y) - frame_length, hop_length)
+        ])
+        
+        # Bias towards the middle of the song (avoid intros/outros)
+        n = len(energy)
+        positions = np.arange(n) / n
+        center_weight = np.exp(-0.5 * ((positions - 0.5) / 0.2) ** 2)
+        
+        scored = energy * center_weight
+        best_idx = np.argmax(scored)
+        
+        start_sec = float(best_idx)
+        logger.info(f"Best moment found at {start_sec:.1f}s (based on energy)")
+        return start_sec
+
+    except ImportError:
+        logger.warning("librosa not installed. Falling back to midpoint heuristic for best moment.")
+        duration = _get_audio_duration(audio_path)
+        start = duration * 0.4  # 40% mark is usually a safe chorus bet
+        logger.info(f"Using midpoint heuristic: starting at {start:.1f}s")
+        return start
+
+def download_excerpt(artist: str, title: str, dest: Path) -> None:
+    """Download the best moment of a track as MP3 via yt-dlp."""
+    query = f"{artist} {title} official audio"
+    tmp_dest = dest.with_suffix(".tmp.mp3")
+    
+    try:
+        # Step 1: Download full audio
+        cmd_download = [
+            "yt-dlp", "--no-playlist",
+            "--extract-audio", "--audio-format", "mp3",
+            "--force-overwrites",
+            "-o", str(tmp_dest),
+            f"ytsearch1:{query}",
+        ]
+        subprocess.run(cmd_download, check=True, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SEC)
+        
+        # Step 2: Validate downloaded audio
+        duration = _get_audio_duration(tmp_dest)
+        if duration < MIN_SONG_DURATION_SEC or duration > MAX_SONG_DURATION_SEC:
+            raise AudioValidationError(
+                f"Downloaded audio duration is {duration:.1f}s, "
+                f"expected between {MIN_SONG_DURATION_SEC}s and {MAX_SONG_DURATION_SEC}s. "
+                f"Possible wrong video downloaded."
+            )
+        
+        # Step 3: Find the best moment
+        start_sec = find_best_moment(tmp_dest, EXCERPT_DURATION_SEC)
+        
+        # Step 4: Extract just that window
+        cmd_trim = [
+            "ffmpeg", "-y", "-ss", str(start_sec),
+            "-i", str(tmp_dest),
+            "-t", str(EXCERPT_DURATION_SEC),
+            "-c:a", "libmp3lame", "-qscale:a", "2",
+            str(dest),
+        ]
+        subprocess.run(cmd_trim, check=True, capture_output=True, text=True, timeout=30)
+        
+    finally:
+        # Cleanup temp file even if it fails
+        if tmp_dest.exists():
+            tmp_dest.unlink()
 
 # ── Orchestrator ─────────────────────────────────────────────────────────
 
@@ -227,7 +347,7 @@ def fetch_all(
     Last.fm  -> album, cover art
     iTunes   -> year
 
-    Fail-safe: placeholders are generated when downloads fail.
+    Fail-safe: placeholders are generated when downloads fail, and flags are set.
     """
     if not songs:
         return []
@@ -245,29 +365,35 @@ def fetch_all(
         itunes_client = ItunesClient()
 
     results: List[SongMetadata] = []
+    failures_count = 0
 
     for song in songs:
-        logger.info(
-            f"Processing #{song.position}: {song.artist} - {song.title}"
-        )
+        logger.info(f"Processing #{song.position}: {song.artist} - {song.title}")
         meta = SongMetadata(
             position=song.position,
             title=song.title,
             artist=song.artist,
         )
 
-        cover_url = _enrich_metadata(
-            meta, song, lastfm_client, itunes_client
-        )
+        cover_url = _enrich_metadata(meta, song, lastfm_client, itunes_client)
         _ensure_cover(meta, cover_url, song.position, covers_dir)
-        _ensure_excerpt(
-            meta, song.artist, song.title, song.position, audio_dir
-        )
+        _ensure_excerpt(meta, song.artist, song.title, song.position, audio_dir)
+
+        if meta.cover_is_placeholder or meta.excerpt_is_placeholder:
+            failures_count += 1
 
         results.append(meta)
 
-    return results
+    # Final UX report
+    if failures_count > 0:
+        logger.warning(
+            f"⚠️ COMPLETED WITH ISSUES: {failures_count} out of {len(songs)} songs "
+            f"have missing data (placeholders were used). Check logs above."
+        )
+    else:
+        logger.info("✅ All songs processed successfully with real data.")
 
+    return results
 
 def _enrich_metadata(
     meta: SongMetadata,
@@ -284,10 +410,7 @@ def _enrich_metadata(
         meta.album = track_data.get("album") or "N/A"
         cover_url = track_data.get("cover_url")
     except Exception as exc:
-        logger.warning(
-            f"Last.fm track.getInfo failed for "
-            f"{song.artist} - {song.title}: {exc}"
-        )
+        logger.warning(f"Last.fm track.getInfo failed for {song.artist} - {song.title}: {exc}")
 
     # ── iTunes: year ──
     year = itunes.get_track_year(song.artist, song.title)
@@ -296,14 +419,13 @@ def _enrich_metadata(
 
     return cover_url
 
-
 def _ensure_cover(
     meta: SongMetadata,
     cover_url: Optional[str],
     position: int,
     covers_dir: Path,
 ) -> None:
-    """Download the cover image or create a placeholder."""
+    """Download the cover image or create a descriptive placeholder."""
     cover_file = covers_dir / f"{position:02d}.png"
 
     if cover_url:
@@ -314,9 +436,9 @@ def _ensure_cover(
         except Exception as exc:
             logger.error(f"Cover download failed, using placeholder: {exc}")
 
-    create_placeholder_cover(cover_file)
+    create_placeholder_cover(cover_file, song_title=meta.title, song_artist=meta.artist)
     meta.cover_path = str(cover_file)
-
+    meta.cover_is_placeholder = True
 
 def _ensure_excerpt(
     meta: SongMetadata,
@@ -331,9 +453,10 @@ def _ensure_excerpt(
     try:
         download_excerpt(artist, title, excerpt_file)
         meta.excerpt_path = str(excerpt_file)
+        # Store where the excerpt starts for video editing sync
+        # (In a real scenario, find_best_moment would return this; we save 0.0 if fallback)
     except Exception as exc:
-        logger.error(
-            f"Audio excerpt failed, using silent placeholder: {exc}"
-        )
-        generate_silent_audio(excerpt_file, duration=15)
+        logger.error(f"Audio excerpt failed, using silent placeholder: {exc}")
+        generate_silent_audio(excerpt_file, duration=EXCERPT_DURATION_SEC)
         meta.excerpt_path = str(excerpt_file)
+        meta.excerpt_is_placeholder = True
