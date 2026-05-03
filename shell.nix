@@ -11,6 +11,7 @@ pkgs.mkShell {
       python-dotenv
       filetype
       pillow
+      librosa
 
       # Dependências de Desenvolvimento (Dev)
       pytest
