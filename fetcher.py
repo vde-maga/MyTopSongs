@@ -379,7 +379,7 @@ def fetch_all(
             comment=song.comment,
         )
 
-        cover_url = _enrich_metadata(meta, song, lastfm_client, itunes_client)
+        cover_url = _enrich_metadata(meta, song, lastfm_client, itunes_client, interactive=interactive)
         _ensure_cover(meta, cover_url, song.position, covers_dir, interactive=interactive)
         _ensure_excerpt(meta, song.artist, song.title, song.position, audio_dir)
 
@@ -404,6 +404,7 @@ def _enrich_metadata(
     song: SongInput,
     lastfm: LastFmClient,
     itunes: ItunesClient,
+    interactive: bool = False,
 ) -> Optional[str]:
     """Populate *meta* from APIs."""
     cover_url: Optional[str] = None
@@ -416,10 +417,26 @@ def _enrich_metadata(
     except Exception as exc:
         logger.warning(f"Last.fm track.getInfo failed for {song.artist} - {song.title}: {exc}")
 
+    # ── Interactive Album Fallback ──
+    if interactive and meta.album == "N/A":
+        print(f"\n❌ Álbum não encontrado para: {meta.artist} - {meta.title}")
+        user_input = input("👉 Insere o nome do álbum ou prime Enter para manter 'N/A': ").strip()
+        if user_input:
+            meta.album = user_input
+            print("✅ Álbum atualizado!")
+
     # ── iTunes: year ──
     year = itunes.get_track_year(song.artist, song.title)
     if year:
         meta.year = year
+
+    # ── Interactive Year Fallback ──
+    if interactive and meta.year == "N/A":
+        print(f"\n❌ Ano não encontrado para: {meta.artist} - {meta.title}")
+        user_input = input("👉 Insere o ano ou prime Enter para manter 'N/A': ").strip()
+        if user_input:
+            meta.year = user_input
+            print("✅ Ano atualizado!")
 
     return cover_url
 
