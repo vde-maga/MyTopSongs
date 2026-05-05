@@ -397,7 +397,48 @@ def fetch_all(
     else:
         logger.info("✅ All songs processed successfully with real data.")
 
+    _print_summary_table(results)
+
     return results
+
+
+def _print_summary_table(results: List[SongMetadata]) -> None:
+    """Print a user-friendly summary table of all processed songs."""
+    if not results:
+        print("No songs processed.")
+        return
+
+    print("\n" + "=" * 90)
+    print("SUMMARY OF PROCESSED SONGS")
+    print("=" * 90)
+
+    # Header
+    header = (
+        f"{'Pos':<6} | {'Title':<25} | {'Artist':<18} | "
+        f"{'Cover':<8} | {'Audio':<8} | {'Album':<15} | {'Year':<6}"
+    )
+    print(header)
+    print("-" * 90)
+
+    # Rows
+    for meta in results:
+        cover_status = "OK" if not meta.cover_is_placeholder else "PLCH"
+        audio_status = "OK" if not meta.excerpt_is_placeholder else "PLCH"
+
+        # Truncate long fields for display
+        title = (meta.title[:22] + "...") if len(meta.title) > 25 else meta.title
+        artist = (meta.artist[:15] + "...") if len(meta.artist) > 18 else meta.artist
+        album = (meta.album[:12] + "...") if len(meta.album) > 15 else meta.album
+
+        row = (
+            f"{meta.position:02d}   | {title:<25} | {artist:<18} | "
+            f"{cover_status:<8} | {audio_status:<8} | {album:<15} | {meta.year:<6}"
+        )
+        print(row)
+
+    print("=" * 90)
+    print("Legend: OK = Real data, PLCH = Placeholder used")
+    print("=" * 90 + "\n")
 
 def _enrich_metadata(
     meta: SongMetadata,
