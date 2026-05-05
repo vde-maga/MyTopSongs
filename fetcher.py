@@ -58,6 +58,7 @@ class SongMetadata:
     position: int
     title: str
     artist: str
+    comment: Optional[str] = None
     album: str = "N/A"
     year: str = "N/A"
     cover_path: str = ""
@@ -375,6 +376,7 @@ def fetch_all(
             position=song.position,
             title=song.title,
             artist=song.artist,
+            comment=song.comment,
         )
 
         cover_url = _enrich_metadata(meta, song, lastfm_client, itunes_client)
