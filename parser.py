@@ -1,7 +1,7 @@
 import re
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from dataclasses import dataclass
 
 @dataclass(frozen=True)
@@ -9,8 +9,9 @@ class SongInput:
     position: int
     title: str
     artist: str
+    comment: Optional[str] = None
 
-LINE_RE = re.compile(r'^(\d+)\.\s+(.+?)\s+-\s+(.+)$')
+LINE_RE = re.compile(r'^(\d+)\.\s+(.+?)\s+-\s+(.+?)(?:\s+-\s+(.+))?$')
 
 def parse_songs(filepath: Path) -> List[SongInput]:
     """Parse the input file and return validated SongInput list. Exit on any error."""
@@ -30,6 +31,7 @@ def parse_songs(filepath: Path) -> List[SongInput]:
             position = int(match.group(1))
             title = match.group(2).strip()
             artist = match.group(3).strip()
-            songs.append(SongInput(position=position, title=title, artist=artist))
+            comment = match.group(4).strip() if match.group(4) else None
+            songs.append(SongInput(position=position, title=title, artist=artist, comment=comment))
 
     return songs
