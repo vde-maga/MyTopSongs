@@ -38,6 +38,7 @@ COLOR_POSITION = (255, 255, 255)
 COLOR_TITLE = (45, 24, 41)
 COLOR_ARTIST = (86, 114, 41)
 COLOR_INFO = (159, 183, 234)
+COLOR_COMMENT = (255, 213, 79)  # Amarelo dourado para destacar comentários
 COLOR_BG_FALLBACK = (20, 20, 20)
 COLOR_OVERLAY = (0, 0, 0, 100) # Overlay escuro para contraste do fundo
 
@@ -52,11 +53,15 @@ TEXT_MARGIN_LEFT = 80
 RIGHT_MARGIN = 100
 BOTTOM_MARGIN = 40
 
+# Tamanhos de fonte para comentário
+COMMENT_SIZE = 34
+
 # Layout - Espaçamentos verticais
 SPACING_AFTER_POSITION = 15
 SPACING_AFTER_TITLE = 15
 SPACING_AFTER_ARTIST = 30
 SPACING_AFTER_INFO_LINE = 15
+SPACING_AFTER_COMMENT = 20
 LINE_SPACING = 8
 
 
@@ -306,8 +311,14 @@ def create_frame(
         {"text": meta.title, "size": TITLE_SIZE, "color": COLOR_TITLE, "space": SPACING_AFTER_TITLE},
         {"text": meta.artist, "size": ARTIST_SIZE, "color": COLOR_ARTIST, "space": SPACING_AFTER_ARTIST},
         {"text": f"Álbum: {meta.album}", "size": INFO_SIZE, "color": COLOR_INFO, "space": SPACING_AFTER_INFO_LINE},
-        {"text": f"Ano: {meta.year}", "size": INFO_SIZE, "color": COLOR_INFO, "space": 0},
+        {"text": f"Ano: {meta.year}", "size": INFO_SIZE, "color": COLOR_INFO, "space": SPACING_AFTER_COMMENT if meta.comment else 0},
     ]
+    
+    # Adicionar comentário se existir
+    if meta.comment:
+        elements.append(
+            {"text": f'"{meta.comment}"', "size": COMMENT_SIZE, "color": COLOR_COMMENT, "space": 0}
+        )
 
     # Calcular limites de texto com base na capa
     cover_x_start = 100
