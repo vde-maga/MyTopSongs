@@ -47,7 +47,7 @@ def main(input_file: str = "input.txt", output_video: str = "output.mp4", intera
     logger.info("Assembling video with transitions...")
     assemble_video(metadatas, tmp_dir / "frames", tmp_dir / "audio", Path(output_video))
 
-    logger.info(f"Video successfully saved to {output_video}")
+    print(f"\n✅ Video successfully saved to {output_video}")
 
 
 if __name__ == "__main__":
