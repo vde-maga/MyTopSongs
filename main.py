@@ -35,7 +35,7 @@ def main(input_file: str = "input.txt", output_video: str = "output.mp4"):
 
     logger.info("Fetching metadata, covers, and audio excerpts...")
     try:
-        metadatas = fetch_all(songs, tmp_dir)
+        metadatas = fetch_all(songs, tmp_dir, interactive=True)
     except ApiKeyError as e:
         # Se a API key não estiver no .env, falhamos graciosamente com uma mensagem clara
         logger.critical(f"Configuration error: {e}")
