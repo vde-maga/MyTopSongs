@@ -294,7 +294,7 @@ def download_excerpt(artist: str, title: str, dest: Path) -> None:
     tmp_dest = dest.with_suffix(".tmp.mp3")
     
     try:
-        # Step 1: Download full audio
+        # Step 1: Download full audio (let yt-dlp show its progress bar)
         cmd_download = [
             "yt-dlp", "--no-playlist",
             "--extract-audio", "--audio-format", "mp3",
@@ -302,7 +302,7 @@ def download_excerpt(artist: str, title: str, dest: Path) -> None:
             "-o", str(tmp_dest),
             f"ytsearch1:{query}",
         ]
-        subprocess.run(cmd_download, check=True, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SEC)
+        subprocess.run(cmd_download, check=True, text=True, timeout=SUBPROCESS_TIMEOUT_SEC)
         
         # Step 2: Validate downloaded audio
         duration = _get_audio_duration(tmp_dest)
@@ -369,8 +369,11 @@ def fetch_all(
 
     results: List[SongMetadata] = []
     failures_count = 0
+    skip_all = [False]  # Mutable list to track skip-all state
 
-    for song in songs:
+    total = len(songs)
+    for idx, song in enumerate(songs, 1):
+        print(f"\n[{idx}/{total}] Processing #{song.position}: {song.artist} - {song.title}")
         logger.info(f"Processing #{song.position}: {song.artist} - {song.title}")
         meta = SongMetadata(
             position=song.position,
@@ -379,9 +382,23 @@ def fetch_all(
             comment=song.comment,
         )
 
-        cover_url = _enrich_metadata(meta, song, lastfm_client, itunes_client, interactive=interactive)
-        _ensure_cover(meta, cover_url, song.position, covers_dir, interactive=interactive)
+        # Metadata
+        t0 = time.time()
+        print(f"  → Fetching metadata...", end=" ", flush=True)
+        cover_url = _enrich_metadata(meta, song, lastfm_client, itunes_client, interactive=interactive, skip_all=skip_all)
+        print(f"done ({time.time() - t0:.1f}s)")
+
+        # Cover
+        t0 = time.time()
+        print(f"  → Processing cover...", end=" ", flush=True)
+        _ensure_cover(meta, cover_url, song.position, covers_dir, interactive=interactive, skip_all=skip_all)
+        print(f"done ({time.time() - t0:.1f}s)")
+
+        # Audio
+        t0 = time.time()
+        print(f"  → Downloading audio (this may take a while)...", end=" ", flush=True)
         _ensure_excerpt(meta, song.artist, song.title, song.position, audio_dir)
+        print(f"done ({time.time() - t0:.1f}s)")
 
         if meta.cover_is_placeholder or meta.excerpt_is_placeholder:
             failures_count += 1
@@ -446,6 +463,7 @@ def _enrich_metadata(
     lastfm: LastFmClient,
     itunes: ItunesClient,
     interactive: bool = False,
+    skip_all: Optional[list] = None,
 ) -> Optional[str]:
     """Populate *meta* from APIs."""
     cover_url: Optional[str] = None
@@ -460,11 +478,18 @@ def _enrich_metadata(
 
     # ── Interactive Album Fallback ──
     if interactive and meta.album == "N/A":
-        print(f"\n❌ Álbum não encontrado para: {meta.artist} - {meta.title}")
-        user_input = input("👉 Insere o nome do álbum ou prime Enter para manter 'N/A': ").strip()
-        if user_input:
-            meta.album = user_input
-            print("✅ Álbum atualizado!")
+        if skip_all and skip_all[0]:
+            pass  # Skip all is active, keep N/A
+        else:
+            print(f"\n❌ Álbum não encontrado para: {meta.artist} - {meta.title}")
+            user_input = input("👉 Insere o nome do álbum (ou 's' para saltar todos): ").strip()
+            if user_input.lower() == 's':
+                if skip_all:
+                    skip_all[0] = True
+                print("⏭️  A saltar todos os prompts restantes...")
+            elif user_input:
+                meta.album = user_input
+                print("✅ Álbum atualizado!")
 
     # ── iTunes: year ──
     year = itunes.get_track_year(song.artist, song.title)
@@ -473,11 +498,18 @@ def _enrich_metadata(
 
     # ── Interactive Year Fallback ──
     if interactive and meta.year == "N/A":
-        print(f"\n❌ Ano não encontrado para: {meta.artist} - {meta.title}")
-        user_input = input("👉 Insere o ano ou prime Enter para manter 'N/A': ").strip()
-        if user_input:
-            meta.year = user_input
-            print("✅ Ano atualizado!")
+        if skip_all and skip_all[0]:
+            pass  # Skip all is active, keep N/A
+        else:
+            print(f"\n❌ Ano não encontrado para: {meta.artist} - {meta.title}")
+            user_input = input("👉 Insere o ano (ou 's' para saltar todos): ").strip()
+            if user_input.lower() == 's':
+                if skip_all:
+                    skip_all[0] = True
+                print("⏭️  A saltar todos os prompts restantes...")
+            elif user_input:
+                meta.year = user_input
+                print("✅ Ano atualizado!")
 
     return cover_url
 
@@ -487,6 +519,7 @@ def _ensure_cover(
     position: int,
     covers_dir: Path,
     interactive: bool = False,
+    skip_all: Optional[list] = None,
 ) -> None:
     """Download the cover image, ask user for input, or create a placeholder."""
     cover_file = covers_dir / f"{position:02d}.png"
@@ -501,14 +534,17 @@ def _ensure_cover(
             logger.error(f"Cover download from API failed: {exc}")
 
     # ── 2. Interactive Fallback ──
-    if interactive:
+    if interactive and not (skip_all and skip_all[0]):
         print(f"\n❌ Capa não encontrada para: {meta.artist} - {meta.title}")
         user_input = input(
-            "👉 Insere um URL, o caminho para um ficheiro local, "
-            "ou prime Enter para gerar placeholder: "
+            "👉 Insere um URL/caminho (ou 's' para saltar todos): "
         ).strip().strip("'\"")  # Remove quotes from copy-pasted paths
 
-        if user_input:
+        if user_input.lower() == 's':
+            if skip_all:
+                skip_all[0] = True
+            print("⏭️  A saltar todos os prompts restantes...")
+        elif user_input:
             try:
                 # Check if it's a URL
                 if user_input.lower().startswith(("http://", "https://")):
